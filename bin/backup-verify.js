@@ -5,12 +5,15 @@ import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
+import logger from '../src/utils/logger.js';
 import { backupCommand } from '../src/commands/backup.js';
 import { verifyCommand } from '../src/commands/verify.js';
 import { diffCommand } from '../src/commands/diff.js';
 import { incrementalVerifyCommand } from '../src/commands/incremental.js';
 import { remotePullCommand, remoteManifestCommand } from '../src/commands/remote.js';
 import { scheduleStartCommand, scheduleListCommand, scheduleRemoveCommand } from '../src/commands/schedule.js';
+import { multiBackupCommand } from '../src/commands/multi-backup.js';
+import { chunkedVerifyCommand } from '../src/commands/chunked-verify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,7 +26,20 @@ const program = new Command();
 program
   .name('backup-verify')
   .description('备份验证 CLI 工具 - 定期抽样备份、检查备份完整性及差异')
-  .version(pkg.version);
+  .version(pkg.version)
+  .option('--log-level <level>', '日志级别: debug, info, warn, error, silent', 'info')
+  .option('--log-json', '启用 JSON 结构化日志输出')
+  .option('--log-file <path>', '日志输出到文件')
+  .hook('preAction', (thisCommand, actionCommand) => {
+    const globalOpts = thisCommand.opts();
+    if (globalOpts.logLevel || globalOpts.logJson || globalOpts.logFile) {
+      logger.configure({
+        level: globalOpts.logLevel,
+        json: globalOpts.logJson || false,
+        logFile: globalOpts.logFile
+      });
+    }
+  });
 
 program
   .command('backup <source>')
@@ -84,6 +100,43 @@ program
       process.exit(isOk ? 0 : 1);
     } catch (err) {
       console.error('增量校验失败:', err.message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('chunked-verify <backup-dir>')
+  .description('大文件分块校验（支持断点续传）')
+  .option('--chunk-size <bytes>', '分块大小（字节），默认 4194304 (4MB)', (v) => Number(v) || 4 * 1024 * 1024, 4 * 1024 * 1024)
+  .option('--no-resume', '禁用断点续传')
+  .option('-v, --verbose', '显示详细信息')
+  .action(async (backupDir, options) => {
+    try {
+      await chunkedVerifyCommand(backupDir, options);
+    } catch (err) {
+      console.error('分块校验失败:', err.message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('multi-backup <sources...>')
+  .description('多源并发备份（支持限流和失败重试）')
+  .requiredOption('-o, --output <dir>', '备份输出目录')
+  .option('-r, --sample-rate <rate>', '抽样比例 (0-1)', parseFloat, 0.1)
+  .option('-e, --exclude <patterns>', '排除目录/文件，逗号分隔', (val) => val.split(','))
+  .option('--extensions <exts>', '指定文件扩展名，逗号分隔')
+  .option('-c, --concurrency <n>', '并发数', (v) => Number(v) || 2, 2)
+  .option('--rate-limit <n>', '每秒最大操作数 (0=不限)', (v) => Number(v) || 0, 0)
+  .option('--retries <n>', '失败重试次数', (v) => Number(v) || 2, 2)
+  .option('--no-resume', '禁用断点续传复制')
+  .option('-v, --verbose', '显示详细信息')
+  .action(async (sources, options) => {
+    try {
+      const { allOk } = await multiBackupCommand(sources, options);
+      process.exit(allOk ? 0 : 1);
+    } catch (err) {
+      console.error('多源备份失败:', err.message);
       process.exit(1);
     }
   });
