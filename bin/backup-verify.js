@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 import logger from '../src/utils/logger.js';
+import { initMetrics, emitBackup, emitVerify, emitDiff, emitMultiBackup, shutdownMetrics, getMetrics } from '../src/metrics/index.js';
+import { initGitHubActions, emitBackupResult, emitVerifyResult, emitDiffResult, flushSummary, setOutput, group, endGroup, error as ghError, notice } from '../src/ci/github-actions.js';
 import { backupCommand } from '../src/commands/backup.js';
 import { verifyCommand } from '../src/commands/verify.js';
 import { diffCommand } from '../src/commands/diff.js';
@@ -21,6 +23,8 @@ const __dirname = dirname(__filename);
 const pkgPath = join(__dirname, '..', 'package.json');
 const pkg = JSON.parse(await readFile(pkgPath, 'utf-8'));
 
+initGitHubActions();
+
 const program = new Command();
 
 program
@@ -30,7 +34,11 @@ program
   .option('--log-level <level>', '日志级别: debug, info, warn, error, silent', 'info')
   .option('--log-json', '启用 JSON 结构化日志输出')
   .option('--log-file <path>', '日志输出到文件')
-  .hook('preAction', (thisCommand, actionCommand) => {
+  .option('--metrics', '启用 Prometheus metrics 端点')
+  .option('--metrics-port <port>', 'Prometheus metrics 端口', (v) => Number(v) || 9090, 9090)
+  .option('--otel', '启用 OpenTelemetry metrics 上报')
+  .option('--otel-endpoint <url>', 'OpenTelemetry OTLP 端点', 'http://localhost:4318/v1/metrics')
+  .hook('preAction', (thisCommand) => {
     const globalOpts = thisCommand.opts();
     if (globalOpts.logLevel || globalOpts.logJson || globalOpts.logFile) {
       logger.configure({
@@ -39,7 +47,21 @@ program
         logFile: globalOpts.logFile
       });
     }
+
+    if (globalOpts.metrics || globalOpts.otel) {
+      initMetrics({
+        prometheus: globalOpts.metrics || false,
+        port: globalOpts.metricsPort,
+        otel: globalOpts.otel || false,
+        otelEndpoint: globalOpts.otelEndpoint
+      });
+    }
   });
+
+program.hook('postAction', async () => {
+  flushSummary();
+  await shutdownMetrics();
+});
 
 program
   .command('backup <source>')
@@ -51,10 +73,16 @@ program
   .option('-n, --name <name>', '备份名称，默认自动生成')
   .option('-v, --verbose', '显示详细信息')
   .action(async (source, options) => {
+    const start = Date.now();
     try {
-      await backupCommand(source, options);
+      const result = await backupCommand(source, options);
+      const duration = (Date.now() - start) / 1000;
+      const fileCount = result.sampledFiles?.length || 0;
+      const totalSize = result.manifest?.totalSize || 0;
+      emitBackup(fileCount, totalSize, duration);
+      emitBackupResult({ backupDir: result.backupDir, fileCount, totalSize });
     } catch (err) {
-      console.error('备份失败:', err.message);
+      ghError(`备份失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -65,11 +93,20 @@ program
   .option('-v, --verbose', '显示详细信息')
   .option('-f, --full', '完整检查（包括多余文件检测）')
   .action(async (backupDir, options) => {
+    const start = Date.now();
     try {
-      const { isOk } = await verifyCommand(backupDir, options);
-      process.exit(isOk ? 0 : 1);
+      const result = await verifyCommand(backupDir, options);
+      const duration = (Date.now() - start) / 1000;
+      emitVerify(
+        result.results.passed.length,
+        result.results.failed.length,
+        result.results.missing.length,
+        duration
+      );
+      emitVerifyResult(result);
+      process.exit(result.isOk ? 0 : 1);
     } catch (err) {
-      console.error('验证失败:', err.message);
+      ghError(`验证失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -81,10 +118,20 @@ program
   .option('-c, --content', '显示文件内容差异（仅文本文件）')
   .option('--export <path>', '导出差异报告（支持 .json 和 .csv 格式）')
   .action(async (backup1, backup2, options) => {
+    const start = Date.now();
     try {
-      await diffCommand(backup1, backup2, options);
+      const result = await diffCommand(backup1, backup2, options);
+      const duration = (Date.now() - start) / 1000;
+      emitDiff(
+        result.added.length,
+        result.removed.length,
+        result.modified.length,
+        result.unchanged.length,
+        duration
+      );
+      emitDiffResult(result);
     } catch (err) {
-      console.error('对比失败:', err.message);
+      ghError(`对比失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -99,7 +146,7 @@ program
       const { isOk } = await incrementalVerifyCommand(backupDir, options);
       process.exit(isOk ? 0 : 1);
     } catch (err) {
-      console.error('增量校验失败:', err.message);
+      ghError(`增量校验失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -114,7 +161,7 @@ program
     try {
       await chunkedVerifyCommand(backupDir, options);
     } catch (err) {
-      console.error('分块校验失败:', err.message);
+      ghError(`分块校验失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -133,12 +180,23 @@ program
   .option('-v, --verbose', '显示详细信息')
   .action(async (sources, options) => {
     try {
-      const { allOk } = await multiBackupCommand(sources, options);
+      const { allOk, succeeded, failed } = await multiBackupCommand(sources, options);
+      emitMultiBackup(succeeded.length, failed.length);
+      setOutput('multi_backup_success', String(succeeded.length));
+      setOutput('multi_backup_failed', String(failed.length));
       process.exit(allOk ? 0 : 1);
     } catch (err) {
-      console.error('多源备份失败:', err.message);
+      ghError(`多源备份失败: ${err.message}`);
       process.exit(1);
     }
+  });
+
+program
+  .command('metrics')
+  .description('输出 Prometheus 格式的 metrics（不启动 HTTP 服务）')
+  .action(async () => {
+    const content = await getMetrics();
+    console.log(content);
   });
 
 const remoteCmd = program.command('remote').description('远端备份操作');
@@ -155,7 +213,7 @@ remoteCmd
     try {
       await remotePullCommand(options);
     } catch (err) {
-      console.error('拉取失败:', err.message);
+      ghError(`拉取失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -170,7 +228,7 @@ remoteCmd
     try {
       await remoteManifestCommand(options);
     } catch (err) {
-      console.error('读取清单失败:', err.message);
+      ghError(`读取清单失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -193,7 +251,7 @@ scheduleCmd
     try {
       await scheduleStartCommand(options);
     } catch (err) {
-      console.error('调度启动失败:', err.message);
+      ghError(`调度启动失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -205,7 +263,7 @@ scheduleCmd
     try {
       await scheduleListCommand();
     } catch (err) {
-      console.error('列表获取失败:', err.message);
+      ghError(`列表获取失败: ${err.message}`);
       process.exit(1);
     }
   });
@@ -217,7 +275,7 @@ scheduleCmd
     try {
       await scheduleRemoveCommand(scheduleId);
     } catch (err) {
-      console.error('删除失败:', err.message);
+      ghError(`删除失败: ${err.message}`);
       process.exit(1);
     }
   });

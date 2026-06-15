@@ -14,3 +14,7 @@ export * from './utils/concurrency.js';
 export { default as logger, StructuredLogger } from './utils/logger.js';
 export { S3Adapter } from './remote/s3.js';
 export { SFTPAdapter } from './remote/sftp.js';
+export * from './metrics/prometheus.js';
+export * from './metrics/otel.js';
+export * from './metrics/index.js';
+export * from './ci/github-actions.js';

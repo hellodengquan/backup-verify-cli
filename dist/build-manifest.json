@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "builds": {
+    "macos-arm64": {
+      "file": "backup-verify-darwin-arm64",
+      "compressed": "bundle-backup-verify-darwin-arm64.mjs.gz",
+      "size": 89793,
+      "compressedSize": 19201
+    }
+  }
+}
