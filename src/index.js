@@ -1,6 +1,12 @@
 export { backupCommand } from './commands/backup.js';
 export { verifyCommand } from './commands/verify.js';
 export { diffCommand } from './commands/diff.js';
+export { incrementalVerifyCommand } from './commands/incremental.js';
+export { remotePullCommand, remoteManifestCommand } from './commands/remote.js';
+export { scheduleStartCommand, scheduleListCommand, scheduleRemoveCommand } from './commands/schedule.js';
 export * from './utils/hash.js';
 export * from './utils/file.js';
+export * from './utils/export.js';
 export { default as logger } from './utils/logger.js';
+export { S3Adapter } from './remote/s3.js';
+export { SFTPAdapter } from './remote/sftp.js';

@@ -4,9 +4,10 @@ import { diffLines } from 'diff';
 import chalk from 'chalk';
 import logger from '../utils/logger.js';
 import { formatSize } from '../utils/file.js';
+import { exportReport } from '../utils/export.js';
 
 export async function diffCommand(backup1, backup2, options) {
-  const { verbose = false, content = false } = options;
+  const { verbose = false, content = false, export: exportPath = null } = options;
 
   logger.section('备份差异对比');
   logger.info(`备份 1: ${backup1}`);
@@ -140,6 +141,26 @@ export async function diffCommand(backup1, backup2, options) {
     logger.warn('两个备份存在差异');
   } else {
     logger.success('两个备份完全一致');
+  }
+
+  const reportData = {
+    generatedAt: new Date().toISOString(),
+    backup1: { path: backup1, fileCount: Object.keys(files1).length, manifest: manifest1 },
+    backup2: { path: backup2, fileCount: Object.keys(files2).length, manifest: manifest2 },
+    summary: {
+      added: added.length,
+      removed: removed.length,
+      modified: modified.length,
+      unchanged: unchanged.length
+    },
+    added,
+    removed,
+    modified,
+    unchanged
+  };
+
+  if (exportPath) {
+    await exportReport(reportData, exportPath);
   }
 
   return { added, removed, modified, unchanged, hasChanges };
