@@ -1,0 +1,27 @@
+{
+  "name": "backup-verify",
+  "version": "1.0.0",
+  "description": "备份验证 CLI 工具 - 定期抽样备份、检查备份完整性及差异",
+  "type": "module",
+  "bin": {
+    "backup-verify": "./bin/backup-verify.js"
+  },
+  "main": "./src/index.js",
+  "scripts": {
+    "start": "node bin/backup-verify.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github-hellodengquan:hellodengquan/backup-verify-cli.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^15.0.0",
+    "diff": "^9.0.0",
+    "fs-extra": "^11.3.5"
+  }
+}
