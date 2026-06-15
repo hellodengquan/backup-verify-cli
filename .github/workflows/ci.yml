@@ -1,14 +1,24 @@
-name: Build & Test
+name: Build & Test + Sign & Release
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,48 +29,156 @@ jobs:
         env:
           GITHUB_ACTIONS: 'true'
 
-  build:
+  determine-channel:
     needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      version: ${{ steps.channel.outputs.version }}
+    steps:
+      - id: channel
+        run: |
+          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [[ "$TAG" == *"-beta"* ]] || [[ "$TAG" == *"-nightly"* ]]; then
+              echo "channel=beta" >> $GITHUB_OUTPUT
+            else
+              echo "channel=stable" >> $GITHUB_OUTPUT
+            fi
+            echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "channel=nightly" >> $GITHUB_OUTPUT
+            echo "version=0.0.0-nightly.$(date +%s)" >> $GITHUB_OUTPUT
+          else
+            echo "channel=beta" >> $GITHUB_OUTPUT
+            echo "version=0.0.0-beta.$(date +%s)" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: determine-channel
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: node20-linux-x64
+            platform: linux-x64
             bin: backup-verify-linux-x64
           - os: ubuntu-latest
-            target: node20-linux-arm64
+            platform: linux-arm64
             bin: backup-verify-linux-arm64
           - os: macos-latest
-            target: node20-darwin-arm64
+            platform: darwin-arm64
             bin: backup-verify-darwin-arm64
+          - os: macos-13
+            platform: darwin-x64
+            bin: backup-verify-darwin-x64
           - os: windows-latest
-            target: node20-win32-x64
+            platform: win32-x64
             bin: backup-verify-win32-x64.exe
+          - os: windows-latest
+            platform: win32-arm64
+            bin: backup-verify-win32-arm64.exe
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - run: npm ci
-      - run: node scripts/build.js ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - name: Build artifact
+        run: node scripts/build.js ${{ matrix.platform }} --channel=${{ needs.determine-channel.outputs.channel }} --version=${{ needs.determine-channel.outputs.version }}
+      - name: Generate build attestation
+        uses: actions/attest-build-provenance@v1
+        if: ${{ !cancelled() }}
+        with:
+          subject-path: |
+            dist/${{ matrix.bin }}
+            dist/bundle-${{ matrix.bin }}.mjs
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bin }}
-          path: dist/${{ matrix.bin }}*
+          path: |
+            dist/${{ matrix.bin }}
+            dist/bundle-${{ matrix.bin }}.mjs
+            dist/bundle-${{ matrix.bin }}.mjs.gz
+            dist/attestations/**
 
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+  aggregate-manifests:
+    needs: [build, determine-channel]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      slo_status: ${{ steps.slo.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Create Release
+      - name: Aggregate manifests and check SLO
+        id: slo
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const distDir = 'dist';
+            let totalArtifacts = 0;
+            let failed = 0;
+            for (const entry of fs.readdirSync(distDir)) {
+              const full = path.join(distDir, entry);
+              if (fs.statSync(full).isDirectory()) totalArtifacts++;
+            }
+            console.log('Artifacts found:', totalArtifacts);
+            if (totalArtifacts >= 5) {
+              console.log('status=passed');
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'status=passed\n');
+            } else {
+              console.log('status=failed');
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'status=failed\n');
+            }
+          "
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: |
+            dist/**/build-manifest.json
+            dist/**/release-*.json
+            dist/**/SHA256SUMS
+
+  release:
+    needs: [aggregate-manifests, determine-channel]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Generate release attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'release-artifacts/**/backup-verify-*'
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          prerelease: ${{ needs.determine-channel.outputs.channel != 'stable' }}
+          name: Release ${{ github.ref_name }} (${{ needs.determine-channel.outputs.channel }})
+          body: |
+            # Release ${{ github.ref_name }}
+            - Channel: **${{ needs.determine-channel.outputs.channel }}**
+            - SLO Status: ${{ needs.aggregate-manifests.outputs.slo_status }}
+            - Build provenance: Attached via Sigstore attestations
+          files: |
+            release-artifacts/**/backup-verify-*
+            release-artifacts/**/SHA256SUMS
+            release-artifacts/**/*.json

@@ -7,7 +7,7 @@ import { dirname, join } from 'path';
 
 import logger from '../src/utils/logger.js';
 import { initMetrics, emitBackup, emitVerify, emitDiff, emitMultiBackup, shutdownMetrics, getMetrics } from '../src/metrics/index.js';
-import { initGitHubActions, emitBackupResult, emitVerifyResult, emitDiffResult, flushSummary, setOutput, group, endGroup, error as ghError, notice } from '../src/ci/github-actions.js';
+import { initGitHubActions, emitBackupResult, emitVerifyResult, emitDiffResult, flushSummary, setOutput, group, endGroup, error as ghError, notice, addSummaryTable, addSummaryHeading } from '../src/ci/github-actions.js';
 import { backupCommand } from '../src/commands/backup.js';
 import { verifyCommand } from '../src/commands/verify.js';
 import { diffCommand } from '../src/commands/diff.js';
@@ -16,6 +16,10 @@ import { remotePullCommand, remoteManifestCommand } from '../src/commands/remote
 import { scheduleStartCommand, scheduleListCommand, scheduleRemoveCommand } from '../src/commands/schedule.js';
 import { multiBackupCommand } from '../src/commands/multi-backup.js';
 import { chunkedVerifyCommand } from '../src/commands/chunked-verify.js';
+import { getSLIEngine, resetSLIEngine } from '../src/release/slo.js';
+import { getChannelFromVersion, isValidChannel, VALID_CHANNELS } from '../src/release/channel.js';
+import { generateBuildAttestation, writeCIAttestationFiles, verifyArtifactAttestation, getBuildEnvironment } from '../src/release/attestation.js';
+import { signArtifact, writeAttestation, sha256File, verifyAttestationSignature } from '../src/release/sigstore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -197,6 +201,213 @@ program
   .action(async () => {
     const content = await getMetrics();
     console.log(content);
+  });
+
+program
+  .command('version')
+  .description('显示版本信息和发布 channel')
+  .option('--json', '以 JSON 格式输出')
+  .option('--channel', '仅显示 channel')
+  .action((options) => {
+    const channel = getChannelFromVersion(pkg.version);
+    if (options.channel) {
+      console.log(channel);
+      return;
+    }
+    if (options.json) {
+      console.log(JSON.stringify({
+        version: pkg.version,
+        name: pkg.name,
+        channel,
+        supportedChannels: VALID_CHANNELS,
+        nodeVersion: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        ci: getBuildEnvironment()
+      }, null, 2));
+      return;
+    }
+    console.log(`${pkg.name} v${pkg.version} (${channel})`);
+    console.log(`Node.js ${process.version} on ${process.platform}-${process.arch}`);
+    console.log(`Supported channels: ${VALID_CHANNELS.join(', ')}`);
+  });
+
+const releaseCmd = program.command('release').description('发布相关子命令');
+
+releaseCmd
+  .command('channel')
+  .description('管理发布 channel')
+  .option('--set <name>', '设置输出目录的 channel (stable/beta/nightly)')
+  .option('--dir <path>', '构建输出目录', 'dist')
+  .option('--list', '列出所有支持的 channel')
+  .action(async (options) => {
+    if (options.list) {
+      for (const ch of VALID_CHANNELS) {
+        console.log(`- ${ch}`);
+      }
+      return;
+    }
+    if (options.set) {
+      if (!isValidChannel(options.set)) {
+        ghError(`无效 channel: ${options.set}`);
+        process.exit(1);
+      }
+      const manifestPath = join(options.dir, 'build-manifest.json');
+      if (!await import('fs').then(m => m.promises.access(manifestPath).then(() => true).catch(() => false))) {
+        ghError(`未找到 manifest: ${manifestPath}`);
+        process.exit(1);
+      }
+      const { readJson, writeJson } = await import('fs-extra');
+      const manifest = await readJson(manifestPath);
+      manifest.channel = options.set;
+      await writeJson(manifestPath, manifest, { spaces: 2 });
+      console.log(`Channel 设置为: ${options.set}`);
+      setOutput('release_channel', options.set);
+      return;
+    }
+    const current = getChannelFromVersion(pkg.version);
+    console.log(`Current channel: ${current}`);
+    setOutput('release_channel', current);
+  });
+
+releaseCmd
+  .command('slo')
+  .description('查看和评估 SLO 状态')
+  .option('--json', '以 JSON 输出')
+  .option('--manifest <path>', 'build manifest 路径', 'dist/build-manifest.json')
+  .option('--backup <total,failed,duration>', '记录一次备份结果 (如 "10,1,30")')
+  .option('--verify <total,failed,missing,duration>', '记录一次校验结果')
+  .action(async (options) => {
+    const slo = getSLIEngine();
+
+    if (options.backup) {
+      const [total, failed, duration] = options.backup.split(',').map(Number);
+      const r = slo.recordBackupResult(total, failed, duration);
+      console.log(`记录备份: successRate=${r.successRate.toFixed(1)}% (${r.passed}/${r.total})`);
+    }
+    if (options.verify) {
+      const [total, failed, missing, duration] = options.verify.split(',').map(Number);
+      const r = slo.recordVerifyResult(total, failed, missing, duration);
+      console.log(`记录校验: successRate=${r.successRate.toFixed(1)}% integrity=${r.integrityRate.toFixed(3)}%`);
+    }
+
+    const report = slo.getReport();
+
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log('=== SLO 报告 ===');
+      console.log(`状态: ${report.sloStatus.healthy ? '✓ 达标' : '✗ 不达标'}`);
+      console.log(`严重告警: ${report.sloStatus.criticalCount}`);
+      console.log(`警告告警: ${report.sloStatus.warningCount}`);
+      for (const [name, sli] of Object.entries(report.slis)) {
+        console.log(`  ${name}: avg=${sli.average} (n=${sli.samples})`);
+      }
+      for (const a of report.alerts.critical) {
+        console.log(`  CRITICAL: ${a.metric} ${a.actual} < target ${a.target}`);
+      }
+      for (const a of report.alerts.warning) {
+        console.log(`  WARNING: ${a.metric} ${a.actual} breached warning threshold`);
+      }
+      addSummaryHeading('SLO 报告');
+      addSummaryTable(
+        ['指标', '状态', '实际值', '目标'],
+        [
+          ['总体', report.sloStatus.healthy ? 'PASS' : 'FAIL', '-', '-'],
+          ['严重告警', report.sloStatus.criticalCount, '-', '0'],
+          ['警告告警', report.sloStatus.warningCount, '-', '0']
+        ]
+      );
+    }
+    setOutput('slo_healthy', String(report.sloStatus.healthy));
+    setOutput('slo_critical_alerts', String(report.sloStatus.criticalCount));
+    setOutput('slo_warning_alerts', String(report.sloStatus.warningCount));
+    process.exit(report.sloStatus.healthy ? 0 : 2);
+  });
+
+const attestCmd = program.command('attest').description('Attestation 子命令');
+
+attestCmd
+  .command('sign <artifact>')
+  .description('为 artifact 生成 Sigstore 风格的签名与 provenance')
+  .requiredOption('-o, --output <dir>', '输出目录')
+  .option('--name <name>', 'artifact 显示名')
+  .option('--repo <url>', '仓库 URL')
+  .option('--sha <hash>', '提交 SHA')
+  .action(async (artifact, options) => {
+    try {
+      const attestation = await signArtifact(artifact, {
+        name: options.name,
+        invocation: { externalParameters: { repo: options.repo, sha: options.sha } }
+      });
+      const paths = await writeAttestation(artifact, attestation, options.output);
+      console.log(`SHA256: ${attestation.hash.value}`);
+      console.log(`Attestation: ${paths.attestationPath}`);
+      console.log(`Provenance: ${paths.provenancePath}`);
+      setOutput('artifact_sha256', attestation.hash.value);
+      setOutput('attestation_path', paths.attestationPath);
+    } catch (err) {
+      ghError(`签名失败: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+attestCmd
+  .command('generate <artifact>')
+  .description('为构建产出物生成 CI build provenance attestation')
+  .requiredOption('-o, --output <dir>', '输出目录')
+  .option('--platform <id>', '平台标识 (如 linux-x64)')
+  .action(async (artifact, options) => {
+    try {
+      const att = await generateBuildAttestation(artifact, {
+        platform: options.platform
+      });
+      const paths = await writeCIAttestationFiles(artifact, att, options.output);
+      console.log(`Bundle: ${paths.bundlePath}`);
+      console.log(`Statement: ${paths.statementPath}`);
+      console.log(`Provenance: ${paths.provenancePath}`);
+      setOutput('attestation_bundle', paths.bundlePath);
+      setOutput('artifact_sha256', att.artifact.sha256);
+    } catch (err) {
+      ghError(`生成 attestation 失败: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+attestCmd
+  .command('verify <artifact>')
+  .description('校验 artifact 的签名或 attestation')
+  .requiredOption('--bundle <path>', 'attestation bundle 路径')
+  .action(async (artifact, options) => {
+    try {
+      const result = await verifyArtifactAttestation(artifact, options.bundle);
+      if (result.valid) {
+        console.log('✓ Attestation 有效');
+        if (result.subject) {
+          console.log(`  Subject: ${JSON.stringify(result.subject)}`);
+        }
+        notice('attestation 验证通过');
+        setOutput('attestation_valid', 'true');
+        process.exit(0);
+      } else {
+        console.log('✗ Attestation 无效:', result.error);
+        ghError(`attestation 验证失败: ${result.error}`);
+        setOutput('attestation_valid', 'false');
+        process.exit(1);
+      }
+    } catch (err) {
+      ghError(`校验失败: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+attestCmd
+  .command('env')
+  .description('输出当前 CI 构建环境')
+  .option('--json', 'JSON 格式')
+  .action((options) => {
+    const env = getBuildEnvironment();
+    console.log(options.json ? JSON.stringify(env, null, 2) : `CI: ${env.ci}`);
   });
 
 const remoteCmd = program.command('remote').description('远端备份操作');
